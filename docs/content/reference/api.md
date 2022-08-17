@@ -675,6 +675,24 @@ the purpose of the change. In future we plan to propagate this field in-place.
 <a href="https://github.com/kubernetes-sigs/cluster-api/issues/5880">https://github.com/kubernetes-sigs/cluster-api/issues/5880</a></p>
 </td>
 </tr>
+<tr>
+<td>
+<code>tunedConfig</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#localobjectreference-v1-core">
+[]Kubernetes core/v1.LocalObjectReference
+</a>
+</em>
+</td>
+<td>
+<p>TunedConfig is a list of references to ConfigMaps containing serialized
+Tuned resources to define the tuning configuration to be applied to
+nodes in the NodePool. The Tuned API is defined here:</p>
+<p><a href="https://github.com/openshift/cluster-node-tuning-operator/blob/2c76314fb3cc8f12aef4a0dcd67ddc3677d5b54f/pkg/apis/tuned/v1/tuned_types.go">https://github.com/openshift/cluster-node-tuning-operator/blob/2c76314fb3cc8f12aef4a0dcd67ddc3677d5b54f/pkg/apis/tuned/v1/tuned_types.go</a></p>
+<p>Each ConfigMap must have a single key named &ldquo;tuned&rdquo; whose value is the
+JSON or YAML of a serialized Tuned.</p>
+</td>
+</tr>
 </table>
 </td>
 </tr>
@@ -5658,6 +5676,24 @@ NOTE: NodeDrainTimeout is different from <code>kubectl drain --timeout</code>
 TODO (alberto): Today changing this field will trigger a recreate rolling update, which kind of defeats
 the purpose of the change. In future we plan to propagate this field in-place.
 <a href="https://github.com/kubernetes-sigs/cluster-api/issues/5880">https://github.com/kubernetes-sigs/cluster-api/issues/5880</a></p>
+</td>
+</tr>
+<tr>
+<td>
+<code>tunedConfig</code></br>
+<em>
+<a href="https://kubernetes.io/docs/reference/generated/kubernetes-api/v1.22/#localobjectreference-v1-core">
+[]Kubernetes core/v1.LocalObjectReference
+</a>
+</em>
+</td>
+<td>
+<p>TunedConfig is a list of references to ConfigMaps containing serialized
+Tuned resources to define the tuning configuration to be applied to
+nodes in the NodePool. The Tuned API is defined here:</p>
+<p><a href="https://github.com/openshift/cluster-node-tuning-operator/blob/2c76314fb3cc8f12aef4a0dcd67ddc3677d5b54f/pkg/apis/tuned/v1/tuned_types.go">https://github.com/openshift/cluster-node-tuning-operator/blob/2c76314fb3cc8f12aef4a0dcd67ddc3677d5b54f/pkg/apis/tuned/v1/tuned_types.go</a></p>
+<p>Each ConfigMap must have a single key named &ldquo;tuned&rdquo; whose value is the
+JSON or YAML of a serialized Tuned.</p>
 </td>
 </tr>
 </tbody>

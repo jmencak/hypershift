@@ -19,6 +19,7 @@ import (
 	configv1 "github.com/openshift/api/config/v1"
 	"github.com/openshift/api/operator/v1alpha1"
 	agentv1 "github.com/openshift/cluster-api-provider-agent/api/v1alpha1"
+	tunedv1 "github.com/openshift/cluster-node-tuning-operator/pkg/apis/tuned/v1"
 	api "github.com/openshift/hypershift/api"
 	hyperv1 "github.com/openshift/hypershift/api/v1alpha1"
 	"github.com/openshift/hypershift/hypershift-operator/controllers/manifests"
@@ -59,15 +60,18 @@ import (
 )
 
 const (
-	finalizer                                = "hypershift.openshift.io/finalizer"
-	autoscalerMaxAnnotation                  = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size"
-	autoscalerMinAnnotation                  = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size"
-	nodePoolAnnotation                       = "hypershift.openshift.io/nodePool"
-	nodePoolAnnotationCurrentConfig          = "hypershift.openshift.io/nodePoolCurrentConfig"
-	nodePoolAnnotationCurrentConfigVersion   = "hypershift.openshift.io/nodePoolCurrentConfigVersion"
-	nodePoolAnnotationTargetConfigVersion    = "hypershift.openshift.io/nodePoolTargetConfigVersion"
-	nodePoolAnnotationUpgradeInProgressTrue  = "hypershift.openshift.io/nodePoolUpgradeInProgressTrue"
-	nodePoolAnnotationUpgradeInProgressFalse = "hypershift.openshift.io/nodePoolUpgradeInProgressFalse"
+	finalizer                                   = "hypershift.openshift.io/finalizer"
+	autoscalerMaxAnnotation                     = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-max-size"
+	autoscalerMinAnnotation                     = "cluster.x-k8s.io/cluster-api-autoscaler-node-group-min-size"
+	nodePoolAnnotation                          = "hypershift.openshift.io/nodePool"
+	nodePoolAnnotationCurrentConfig             = "hypershift.openshift.io/nodePoolCurrentConfig"
+	nodePoolAnnotationCurrentConfigVersion      = "hypershift.openshift.io/nodePoolCurrentConfigVersion"
+	nodePoolAnnotationTargetConfigVersion       = "hypershift.openshift.io/nodePoolTargetConfigVersion"
+	nodePoolAnnotationCurrentTunedConfig        = "hypershift.openshift.io/nodePoolCurrentTunedConfig"
+	nodePoolAnnotationCurrentTunedConfigVersion = "hypershift.openshift.io/nodePoolCurrentTunedConfigVersion"
+	nodePoolAnnotationTargetTunedConfigVersion  = "hypershift.openshift.io/nodePoolTargetTunedConfigVersion"
+	nodePoolAnnotationUpgradeInProgressTrue     = "hypershift.openshift.io/nodePoolUpgradeInProgressTrue"
+	nodePoolAnnotationUpgradeInProgressFalse    = "hypershift.openshift.io/nodePoolUpgradeInProgressFalse"
 
 	nodePoolAnnotationPlatformMachineTemplate = "hypershift.openshift.io/nodePoolPlatformMachineTemplate"
 	nodePoolCoreIgnitionConfigLabel           = "hypershift.openshift.io/core-ignition-config"
@@ -76,6 +80,9 @@ const (
 	TokenSecretTokenKey                       = "token"
 	TokenSecretConfigKey                      = "config"
 	TokenSecretAnnotation                     = "hypershift.openshift.io/ignition-config"
+
+	tunedConfigMapAnnotation                  = "hypershift.openshift.io/tuned-config"
+	tunedConfigKey                            = "tuned"
 )
 
 type NodePoolReconciler struct {
@@ -567,8 +574,100 @@ func (r *NodePoolReconciler) reconcile(ctx context.Context, hcluster *hyperv1.Ho
 		log.Info("Reconciled userData Secret", "result", result)
 	}
 
+	// ############## BEGIN TUNED STUFF ##############
+	// ############## BEGIN TUNED STUFF ##############
+	// ############## BEGIN TUNED STUFF ##############
+
+	log.Info("ENTERING TUNED CONFIG PART")
+	// Validate tunedconfig input.
+
+	tunedConfig, err := r.getTunedConfig(ctx, nodePool, hcluster)
+	// TODO add new status conditions for tuned?
+	if err != nil {
+		setStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+			Type:               hyperv1.NodePoolValidMachineConfigConditionType,
+			Status:             corev1.ConditionFalse,
+			Reason:             hyperv1.NodePoolValidationFailedConditionReason,
+			Message:            err.Error(),
+			ObservedGeneration: nodePool.Generation,
+		})
+		return ctrl.Result{}, fmt.Errorf("failed to get tunedconfig: %w", err)
+	}
+
+	setStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+		Type:               hyperv1.NodePoolValidMachineConfigConditionType,
+		Status:             corev1.ConditionTrue,
+		Reason:             hyperv1.NodePoolAsExpectedConditionReason,
+		ObservedGeneration: nodePool.Generation,
+	})
+
+	// Check if config needs to be updated.
+	targetTunedConfigHash := hashStruct(tunedConfig)
+	isUpdatingTunedConfig := isUpdatingTunedConfig(nodePool, targetTunedConfigHash)
+	if isUpdatingTunedConfig {
+		setStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolCondition{
+			Type:               hyperv1.NodePoolUpdatingConfigConditionType,
+			Status:             corev1.ConditionTrue,
+			Reason:             hyperv1.NodePoolAsExpectedConditionReason,
+			Message:            fmt.Sprintf("Updating Tuned config in progress. Target config: %s", targetTunedConfigHash),
+			ObservedGeneration: nodePool.Generation,
+		})
+		log.Info("NodePool tuned config is updating",
+			"current", nodePool.GetAnnotations()[nodePoolAnnotationCurrentTunedConfig],
+			"target", targetTunedConfigHash)
+	} else {
+		removeStatusCondition(&nodePool.Status.Conditions, hyperv1.NodePoolUpdatingConfigConditionType)
+	}
+
+	// 2. - Reconcile towards expected state of the world.
+	targetTunedConfigVersionHash := hashStruct(tunedConfig + targetVersion)
+	log.Info("Target TunedConfig Version Hash Info:",
+		"target hash", targetTunedConfigVersionHash, "version", targetVersion, "tunedConfig", tunedConfig)
+
+	// Tuned ConfigMaps exist for each NodePool config/version and follow "prefixName-configVersionHash" naming convention.
+	// Ensure old configVersionHash resources are deleted, i.e token Secret and userdata Secret.
+	// TODO clean up old tunedConfig ConfigMaps
+	if isUpdatingVersion || isUpdatingTunedConfig {
+		tunedConfigMap := TunedConfigMap(controlPlaneNamespace, nodePool.Name, nodePool.GetAnnotations()[nodePoolAnnotationCurrentTunedConfigVersion])
+		err := r.Get(ctx, client.ObjectKeyFromObject(tunedConfigMap), tunedConfigMap)
+		if err != nil && !apierrors.IsNotFound(err) {
+			return reconcile.Result{}, fmt.Errorf("failed to get Tuned ConfigMap: %w", err)
+		}
+		if err == nil {
+			if err := r.Delete(ctx, tunedConfigMap); err != nil && !apierrors.IsNotFound(err) {
+				return reconcile.Result{}, fmt.Errorf("failed to delete user data ConfigMap: %w", err)
+			}
+		}
+	}
+	// END TODO
+
+	tunedConfigMap := TunedConfigMap(controlPlaneNamespace, nodePool.Name, targetTunedConfigVersionHash)
+	if result, err := r.CreateOrUpdate(ctx, r.Client, tunedConfigMap, func() error {
+		return reconcileTunedConfigMap(tunedConfigMap, nodePool, tunedConfig)
+	}); err != nil {
+		return ctrl.Result{}, fmt.Errorf("failed to reconcile Tuned ConfigMap: %w", err)
+	} else {
+		log.Info("Reconciled Tuned Config Map", "result", result)
+	}
+
+	nodePool.Status.Version = targetVersion
+	if nodePool.Annotations == nil {
+		nodePool.Annotations = make(map[string]string)
+	}
+	if nodePool.Annotations[nodePoolAnnotationCurrentTunedConfig] != targetTunedConfigHash {
+		log.Info("Tuned Config update complete",
+			"previous", nodePool.Annotations[nodePoolAnnotationCurrentTunedConfig], "new", targetTunedConfigHash)
+		nodePool.Annotations[nodePoolAnnotationCurrentTunedConfig] = targetTunedConfigHash
+	}
+	nodePool.Annotations[nodePoolAnnotationCurrentTunedConfigVersion] = targetTunedConfigVersionHash
+
 	// Store new template hash.
 
+	// ############## END TUNED STUFF ##############
+	// ############## END TUNED STUFF ##############
+	// ############## END TUNED STUFF ##############
+
+	// TODO: Does this mean MC's are unsupported on BM?
 	// non automated infrastructure should not have any machine level cluster-api components
 	if !isAutomatedMachineManagement(nodePool) {
 		nodePool.Status.Version = targetVersion
@@ -807,6 +906,35 @@ func reconcileUserDataSecret(userDataSecret *corev1.Secret, nodePool *hyperv1.No
 	userDataSecret.Data = map[string][]byte{
 		"disableTemplating": []byte(base64.StdEncoding.EncodeToString([]byte("true"))),
 		"value":             userDataValue,
+	}
+	return nil
+}
+
+// jmencak
+func reconcileTunedConfigMap(tunedConfigMap *corev1.ConfigMap, nodePool *hyperv1.NodePool, config string) error {
+	// TODO consider if this needs to be mutable
+	tunedConfigMap.Immutable = k8sutilspointer.BoolPtr(false)
+	if tunedConfigMap.Annotations == nil {
+		tunedConfigMap.Annotations = make(map[string]string)
+	}
+	if tunedConfigMap.Labels == nil {
+		tunedConfigMap.Labels = make(map[string]string)
+	}
+
+	// TODO decide if this should be a label (more efficient listing?) or an annotation. Reference: https://github.com/openshift/hypershift/blob/af0b009e345612996cff5df9d9f0ad84fc9da920/ignition-server/controllers/tokensecret_controller.go#L124
+	tunedConfigMap.Annotations[tunedConfigMapAnnotation] = "true"
+	tunedConfigMap.Labels[tunedConfigMapAnnotation] = "true"
+	tunedConfigMap.Annotations[nodePoolAnnotation] = client.ObjectKeyFromObject(nodePool).String()
+	// TODO consider if something similar is needed for Tuned
+	// active token should never be marked as expired.
+	//delete(tokenSecret.Annotations, hyperv1.IgnitionServerTokenExpirationTimestampAnnotation)
+
+	if tunedConfigMap.Data == nil {
+		tunedConfigMap.Data = map[string]string{}
+		tunedConfigMap.Annotations[TokenSecretTokenGenerationTime] = time.Now().Format(time.RFC3339Nano)
+		tunedConfigMap.Data[TokenSecretTokenKey] = uuid.New().String()		// TODO: do we need this?
+		tunedConfigMap.Data[TokenSecretReleaseKey] = nodePool.Spec.Release.Image
+		tunedConfigMap.Data[tunedConfigKey] = config
 	}
 	return nil
 }
@@ -1186,6 +1314,54 @@ func (r *NodePoolReconciler) getConfig(ctx context.Context,
 	return strings.Join(allConfigPlainText, "\n---\n"), missingConfigs, utilerrors.NewAggregate(errors)
 }
 
+func (r *NodePoolReconciler) getTunedConfig(ctx context.Context,
+	nodePool *hyperv1.NodePool,
+	hcluster *hyperv1.HostedCluster,
+) (configsRaw string, err error) {
+	var configs []corev1.ConfigMap
+	var allConfigPlainText []string
+	var errors []error
+	log := ctrl.LoggerFrom(ctx)
+
+	for _, config := range nodePool.Spec.TunedConfig {
+		// TODO DELETE
+		log.Info(fmt.Sprintf("Iterating nodePool.Spec.Config: %s", config))
+
+		configConfigMap := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      config.Name,
+				Namespace: nodePool.Namespace,
+			},
+		}
+		if err := r.Get(ctx, client.ObjectKeyFromObject(configConfigMap), configConfigMap); err != nil {
+			errors = append(errors, err)
+			continue
+		}
+		configs = append(configs, *configConfigMap)
+	}
+
+	for _, config := range configs {
+		// TODO DELETE
+		log.Info(fmt.Sprintf("Iterating found configmaps. Current name: %s", config.Name))
+		manifestRaw := config.Data[tunedConfigKey]
+		manifest, err := defaultAndValidateConfigManifest([]byte(manifestRaw))
+		log.Info("ran defaultAndValidateConfigManifest with a Tuned.", "Output: ", manifest)
+		if err != nil {
+			errors = append(errors, fmt.Errorf("configmap %q failed validation: %w", config.Name, err))
+			continue
+		}
+
+		allConfigPlainText = append(allConfigPlainText, string(manifest))
+	}
+
+	// These configs are the input to a hash func whose output is used as part of the name of the user-data secret,
+	// so our output must be deterministic.
+	sort.Strings(allConfigPlainText)
+	log.Info(fmt.Sprintf("####### End of getTunedConfig. All Configs: ####### \n %s", strings.Join(allConfigPlainText, "\n---\n")))
+
+	return strings.Join(allConfigPlainText, "\n---\n"), utilerrors.NewAggregate(errors)
+}
+
 // validateManagement does additional backend validation. API validation/default should
 // prevent this from ever fail.
 func validateManagement(nodePool *hyperv1.NodePool) error {
@@ -1221,6 +1397,7 @@ func defaultAndValidateConfigManifest(manifest []byte) ([]byte, error) {
 	scheme := runtime.NewScheme()
 	mcfgv1.Install(scheme)
 	v1alpha1.Install(scheme)
+	tunedv1.AddToScheme(scheme)
 
 	YamlSerializer := serializer.NewSerializerWithOptions(
 		serializer.DefaultMetaFactory, scheme, scheme,
@@ -1246,6 +1423,13 @@ func defaultAndValidateConfigManifest(manifest []byte) ([]byte, error) {
 	case *v1alpha1.ImageContentSourcePolicy:
 	case *mcfgv1.KubeletConfig:
 	case *mcfgv1.ContainerRuntimeConfig:
+	case *tunedv1.Tuned:
+		buff := bytes.Buffer{}
+		if err := YamlSerializer.Encode(obj, &buff); err != nil {
+			return nil, fmt.Errorf("failed to encode config after defaulting it: %w", err)
+		}
+		manifest = buff.Bytes()
+
 	default:
 		return nil, fmt.Errorf("unsupported config type: %T", obj)
 	}
@@ -1279,6 +1463,10 @@ func isUpdatingVersion(nodePool *hyperv1.NodePool, targetVersion string) bool {
 
 func isUpdatingConfig(nodePool *hyperv1.NodePool, targetConfigHash string) bool {
 	return targetConfigHash != nodePool.GetAnnotations()[nodePoolAnnotationCurrentConfig]
+}
+
+func isUpdatingTunedConfig(nodePool *hyperv1.NodePool, targetTunedConfigHash string) bool {
+	return targetTunedConfigHash != nodePool.GetAnnotations()[nodePoolAnnotationCurrentTunedConfig]
 }
 
 func isAutoscalingEnabled(nodePool *hyperv1.NodePool) bool {

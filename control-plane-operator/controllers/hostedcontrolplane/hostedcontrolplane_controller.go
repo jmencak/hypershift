@@ -34,6 +34,7 @@ import (
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/machineapprover"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/manifests"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/mcs"
+	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/nto"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/oapi"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/oauth"
 	"github.com/openshift/hypershift/control-plane-operator/controllers/hostedcontrolplane/ocm"
@@ -761,6 +762,11 @@ func (r *HostedControlPlaneReconciler) reconcile(ctx context.Context, hostedCont
 	r.Log.Info("Reconciling ClusterNetworkOperator")
 	if err := r.reconcileClusterNetworkOperator(ctx, hostedControlPlane, releaseImage, createOrUpdate); err != nil {
 		return fmt.Errorf("failed to reconcile cluster network operator: %w", err)
+	}
+
+	r.Log.Info("Reconciling Cluster Node Tuning Operator")
+	if err := r.reconcileClusterNodeTuningOperator(ctx, hostedControlPlane, releaseImage, createOrUpdate); err != nil {
+		return fmt.Errorf("failed to reconcile cluster node tuning operator: %w", err)
 	}
 
 	r.Log.Info("Reconciling IngressOperator")
@@ -2082,6 +2088,32 @@ func (r *HostedControlPlaneReconciler) reconcileClusterNetworkOperator(ctx conte
 		return cno.ReconcileDeployment(deployment, p, util.APIPort(hcp))
 	}); err != nil {
 		return fmt.Errorf("failed to reconcile cluster network operator deployment: %w", err)
+	}
+	return nil
+}
+
+func (r *HostedControlPlaneReconciler) reconcileClusterNodeTuningOperator(ctx context.Context, hcp *hyperv1.HostedControlPlane, releaseImage *releaseinfo.ReleaseImage, createOrUpdate upsert.CreateOrUpdateFN) error {
+	p := nto.NewParams(hcp, releaseImage.Version(), releaseImage.ComponentImages(), r.SetDefaultSecurityContext)
+
+	metricsService := manifests.ClusterNodeTuningOperatorMetricsService(hcp.Namespace)
+	if _, err := createOrUpdate(ctx, r, metricsService, func() error {
+		return nto.ReconcileClusterNodeTuningOperatorMetricsService(metricsService, p.OwnerRef)
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile node tuning operator metrics service: %w", err)
+	}
+
+	serviceMonitor := manifests.ClusterNodeTuningOperatorServiceMonitor(hcp.Namespace)
+	if _, err := createOrUpdate(ctx, r, serviceMonitor, func() error {
+		return nto.ReconcileClusterNodeTuningOperatorServiceMonitor(serviceMonitor, p.OwnerRef, hcp.Spec.ClusterID, r.MetricsSet)
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile node tuning operator service monitor: %w", err)
+	}
+
+	deployment := manifests.ClusterNodeTuningOperatorDeployment(hcp.Namespace)
+	if _, err := createOrUpdate(ctx, r, deployment, func() error {
+		return nto.ReconcileDeployment(deployment, p)
+	}); err != nil {
+		return fmt.Errorf("failed to reconcile cluster node tuning operator deployment: %w", err)
 	}
 	return nil
 }
